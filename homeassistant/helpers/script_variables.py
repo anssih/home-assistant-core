@@ -52,9 +52,14 @@ class ScriptVariables:
             if key in rendered_variables:
                 continue
 
-            rendered_variables[key] = template.render_complex(
-                value, rendered_variables, limited
-            )
+            try:
+                rendered_variables[key] = template.render_complex(
+                    value, rendered_variables, limited
+                )
+            except Exception as err:
+                raise type(err)(
+                    f"Error processing variable '{key}' content '{value}': {err}"
+                ) from err
 
         return rendered_variables
 
