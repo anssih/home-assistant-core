@@ -334,3 +334,13 @@ class AbstractTemplateEntity(Entity):
                 if attr not in last_state.attributes:
                     continue
                 self._attr_extra_state_attributes[attr] = last_state.attributes[attr]
+        elif self._attributes_template is not None:
+            # Template-generated keys are unknown until a trigger fires.
+            excluded: set[str] = set(EntityStateAttribute)
+            if self._blocked_attributes is not None:
+                excluded.update(self._blocked_attributes.blocked(last_state.attributes))
+            self._attr_extra_state_attributes = {
+                attr: value
+                for attr, value in last_state.attributes.items()
+                if attr not in excluded
+            }

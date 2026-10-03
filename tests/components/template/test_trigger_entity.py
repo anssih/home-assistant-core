@@ -17,18 +17,196 @@ from homeassistant.const import (
     STATE_ON,
     STATE_UNKNOWN,
 )
-from homeassistant.core import HomeAssistant, ServiceCall
+from homeassistant.core import HomeAssistant, ServiceCall, State
 from homeassistant.helpers import condition, template
 from homeassistant.helpers.script import Script
 from homeassistant.helpers.trigger_template_entity import CONF_PICTURE
+from homeassistant.helpers.typing import ConfigType
 from homeassistant.setup import async_setup_component
 
 from .conftest import async_trigger
 
-from tests.common import assert_setup_component
+from tests.common import assert_setup_component, mock_restore_cache_with_extra_data
 
 _ICON_TEMPLATE = 'mdi:o{{ "n" if value=="on" else "ff" }}'
 _PICTURE_TEMPLATE = '/local/picture_o{{ "n" if value=="on" else "ff" }}'
+_RESTORE_ENTITY_NAME = "test_attribute_restore"
+_RESTORE_EVENT = "test_attribute_restore"
+
+
+@pytest.mark.parametrize(
+    ("domain", "state_template", "expected_state", "extra_data", "managed_attributes"),
+    [
+        pytest.param(
+            "sensor",
+            "ready",
+            "ready",
+            {"native_value": "ready", "native_unit_of_measurement": None},
+            {"state_class": "measurement", "last_reset": "2026-01-01T00:00:00+00:00"},
+            id="sensor",
+        ),
+        pytest.param(
+            "binary_sensor",
+            "{{ true }}",
+            STATE_ON,
+            {"auto_off_time": None},
+            {},
+            id="binary_sensor",
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    ("attributes", "expected_attributes"),
+    [
+        pytest.param(
+            {"count": "{{ this.attributes.get('count', 0) + 1 }}"},
+            {"count": 41},
+            id="mapping",
+        ),
+        pytest.param(
+            "{{ dict(count=this.attributes.get('count', 0) + 1) }}",
+            {
+                "count": 41,
+                "payload": {"history": ["saved"]},
+            },
+            id="template",
+        ),
+    ],
+)
+async def test_restore_attributes_before_trigger(
+    hass: HomeAssistant,
+    domain: str,
+    state_template: str,
+    expected_state: str,
+    extra_data: ConfigType,
+    managed_attributes: ConfigType,
+    attributes: dict[str, str] | str,
+    expected_attributes: ConfigType,
+) -> None:
+    """Restore attributes before the first trigger and expose them through this."""
+    entity_id = f"{domain}.{_RESTORE_ENTITY_NAME}"
+    mock_restore_cache_with_extra_data(
+        hass,
+        (
+            (
+                State(
+                    entity_id,
+                    expected_state,
+                    {
+                        "count": 41,
+                        "payload": {"history": ["saved"]},
+                        "friendly_name": "Old name",
+                        "icon": "mdi:old",
+                        "entity_picture": "/local/old.png",
+                        "device_class": "humidity",
+                        "unit_of_measurement": "%",
+                        "supported_features": 0,
+                        **managed_attributes,
+                    },
+                ),
+                extra_data,
+            ),
+        ),
+    )
+    assert await async_setup_component(
+        hass,
+        DOMAIN,
+        {
+            DOMAIN: {
+                "triggers": {"trigger": "event", "event_type": _RESTORE_EVENT},
+                domain: {
+                    "name": _RESTORE_ENTITY_NAME,
+                    "state": state_template,
+                    "attributes": attributes,
+                },
+            }
+        },
+    )
+    await hass.async_block_till_done()
+    await hass.async_start()
+    await hass.async_block_till_done()
+
+    state = hass.states.get(entity_id)
+    assert state is not None
+    assert state.state == expected_state
+    assert state.attributes == {**expected_attributes, "friendly_name": "Old name"}
+    entity = hass.data[domain].get_entity(entity_id)
+    assert entity.extra_state_attributes == expected_attributes
+
+    hass.bus.async_fire(_RESTORE_EVENT)
+    await hass.async_block_till_done()
+
+    state = hass.states.get(entity_id)
+    assert state is not None
+    assert state.attributes == {"count": 42, "friendly_name": _RESTORE_ENTITY_NAME}
+
+
+@pytest.mark.parametrize(
+    ("domain", "state_template", "expected_state"),
+    [
+        pytest.param("sensor", "ready", "ready", id="sensor"),
+        pytest.param("binary_sensor", "{{ true }}", STATE_ON, id="binary_sensor"),
+    ],
+)
+@pytest.mark.parametrize(
+    "attributes",
+    [
+        pytest.param(
+            {"count": "{{ this.attributes.get('count', 0) + 1 }}"}, id="mapping"
+        ),
+        pytest.param(
+            "{{ dict(count=this.attributes.get('count', 0) + 1) }}", id="template"
+        ),
+    ],
+)
+async def test_reload_preserves_attributes(
+    hass: HomeAssistant,
+    domain: str,
+    state_template: str,
+    expected_state: str,
+    attributes: dict[str, str] | str,
+) -> None:
+    """Preserve trigger template attributes on reload and on the next trigger."""
+    entity_id = f"{domain}.{_RESTORE_ENTITY_NAME}"
+    config = {
+        DOMAIN: {
+            "triggers": {"trigger": "event", "event_type": _RESTORE_EVENT},
+            domain: {
+                "name": _RESTORE_ENTITY_NAME,
+                "state": state_template,
+                "attributes": attributes,
+            },
+        }
+    }
+    assert await async_setup_component(hass, DOMAIN, config)
+    await hass.async_block_till_done()
+    await hass.async_start()
+    await hass.async_block_till_done()
+
+    hass.bus.async_fire(_RESTORE_EVENT)
+    await hass.async_block_till_done()
+
+    state = hass.states.get(entity_id)
+    assert state is not None
+    assert state.attributes["count"] == 1
+
+    with patch(
+        "homeassistant.config.load_yaml_config_file", autospec=True, return_value=config
+    ):
+        await hass.services.async_call(DOMAIN, SERVICE_RELOAD, blocking=True)
+        await hass.async_block_till_done()
+
+    state = hass.states.get(entity_id)
+    assert state is not None
+    assert state.state == expected_state
+    assert state.attributes["count"] == 1
+
+    hass.bus.async_fire(_RESTORE_EVENT)
+    await hass.async_block_till_done()
+
+    state = hass.states.get(entity_id)
+    assert state is not None
+    assert state.attributes["count"] == 2
 
 
 class TestEntity(trigger_entity.TriggerEntity):
